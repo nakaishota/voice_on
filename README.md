@@ -69,8 +69,10 @@ open VoiceOn.app            # メニューバーに 🎙️ が出ます
 | `holdThresholdMs` | 200 | 長押し判定（ms） |
 | `localeIdentifier` | `ja-JP` | 認識言語 |
 | `cmdGestureEnabled` | true | ⌘ダブルタップ＆ホールドの有効/無効 |
-| `cursorAnimationFile` | nil | カーソルに重ねる GIF 等の絶対パス（指定すると点滅丸の代わりに表示） |
-| `levelQuietColor` / `levelLoudColor` | 青 / 赤 | 音量連動インジケータの色 |
+| `indicatorPosition` | `.bottomLeft` | 録音インジケータの位置（topCenter / bottomCenter / bottomLeft / topRight / mouse） |
+| `cursorRingColor` / `cursorCoreColor` | 白 / 赤 | リング色 / 中心ドット色 |
+| `cursorBaseDiameter` | 30 | リング基準サイズ（音量で拡大） |
+| `cursorAnimationFile` | nil | カーソルに重ねる GIF 等の絶対パス（指定するとリングの代わりに表示） |
 | `levelGain` / `levelCurve` | 28 / 0.6 | 音量感度（大きいほど／小さいほど敏感） |
 | `segmentMinChars` | 3 | 区切り判定のしきい値（二重登録・消失の調整） |
 

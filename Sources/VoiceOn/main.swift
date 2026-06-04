@@ -17,6 +17,15 @@ import Speech
 
 // MARK: - 設定
 
+/// 録音インジケータの表示位置
+enum IndicatorPosition {
+    case topCenter      // 画面上・中央（ノッチ風）
+    case bottomCenter   // 画面下・中央
+    case bottomLeft     // 左下
+    case topRight       // 右上（メニューバー寄り）
+    case mouse          // マウス追従
+}
+
 enum Config {
     static let triggerKeycode: Int64 = 102      // 英数 (kVK_JIS_Eisu)
     static let holdThresholdMs: Int = 200       // これ以上の長押しで録音開始
@@ -37,13 +46,13 @@ enum Config {
     static let cursorAnimationFile: String? = nil   // 例: "~/path/to/cursor.gif" の絶対パス
     static let animationSize = NSSize(width: 48, height: 48)
 
-    // フォールバックの「音量連動ドット」
-    static let levelQuietColor: NSColor = .systemBlue  // 静かなときの色
-    static let levelLoudColor: NSColor = .systemRed    // 大きいときの色
-    static let levelGain: Float = 28                   // 感度（大きいほど小さな音で反応）
+    // 録音中インジケータ（Apple純正風・上品）
+    static let indicatorPosition: IndicatorPosition = .bottomLeft   // 表示位置
+    static let levelGain: Float = 28                   // 音量感度（大きいほど小さな音で反応）
     static let levelCurve: Float = 0.6                  // <1 で低音量を持ち上げる（小さいほど敏感）
-    static let dotDiameter: CGFloat = 22               // 基準の直径（音量で拡大）
-    static let dotAlphaMax: CGFloat = 0.9              // 最大不透明度
+    static let cursorRingColor: NSColor = .white        // 呼吸するリング（明暗どちらでも見えるよう影付き）
+    static let cursorCoreColor: NSColor = .systemRed    // 中心の録音ドット
+    static let cursorBaseDiameter: CGFloat = 30         // リング基準径（音量で拡大）
 }
 
 let kSynthMagic: Int64 = 0x564F_4943 // "VOIC"
@@ -67,6 +76,8 @@ final class SpeechEngine {
     var onError: ((String) -> Void)?
     /// マイク音量（0〜1）をリアルタイムに通知
     var onLevel: ((Float) -> Void)?
+    /// 認識中の累計文字数をリアルタイムに通知（メインスレッド）
+    var onCharCount: ((Int) -> Void)?
 
     func start() {
         guard !isRunning else { return }
@@ -140,6 +151,7 @@ final class SpeechEngine {
                 committedText += segmentText   // 前のセグメントを確定
             }
             segmentText = text                 // 現セグメントを更新
+            onCharCount?(committedText.count + segmentText.count)
         }
 
         if isFinal {
@@ -348,38 +360,163 @@ final class GifEffectView: NSImageView, CursorEffect {
     func stop() { animates = false }
 }
 
-/// 音量に応じて色・濃さ・大きさが変わる丸（フォールバック）
+/// Apple純正風の上品な録音インジケータ。
+/// 穏やかに呼吸するリング＋中心の小さな録音ドット＋柔らかいグロー。音量でそっと反応。
 final class LevelDotView: NSView, CursorEffect {
-    /// 0（静か）〜1（大きい）
-    var level: CGFloat = 0 { didSet { needsDisplay = true } }
+    /// 0（静か）〜1（大きい）。音声側から更新される目標値。
+    var level: CGFloat = 0
+
+    private let ringLayer = CAShapeLayer()
+    private let coreLayer = CAShapeLayer()
+    private let countLayer = CATextLayer()
+    private var timer: Timer?
+    private var rippleTimer: Timer?
+    private var displayedLevel: CGFloat = 0
+    private var phase: Double = 0
+    private var lastTick = Date()
+    private let backingScale = NSScreen.main?.backingScaleFactor ?? 2
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
+        layer?.masksToBounds = false
+        setupLayers()
     }
     required init?(coder: NSCoder) { fatalError() }
 
-    func start() { level = 0 }
-    func stop() { level = 0 }
+    private func setupLayers() {
+        let scale = NSScreen.main?.backingScaleFactor ?? 2
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
 
-    override func draw(_ dirtyRect: NSRect) {
-        let lv = max(0, min(1, level))
-        let base = Self.blend(Config.levelQuietColor, Config.levelLoudColor, lv)
-        let alpha = 0.25 + (Config.dotAlphaMax - 0.25) * lv
-        base.withAlphaComponent(alpha).setFill()
-        let d = Config.dotDiameter * (0.6 + 0.9 * lv)   // 音量で拡大
-        let rect = NSRect(x: (bounds.width - d) / 2, y: (bounds.height - d) / 2, width: d, height: d)
-        NSBezierPath(ovalIn: rect).fill()
+        // 呼吸するリング（白＋柔らかい影で明暗どちらの背景でも視認）
+        let ringD = Config.cursorBaseDiameter
+        ringLayer.bounds = CGRect(x: 0, y: 0, width: ringD, height: ringD)
+        ringLayer.position = center
+        ringLayer.path = CGPath(ellipseIn: ringLayer.bounds, transform: nil)
+        ringLayer.fillColor = NSColor.clear.cgColor
+        ringLayer.strokeColor = Config.cursorRingColor.cgColor
+        ringLayer.lineWidth = 3.5
+        ringLayer.contentsScale = scale
+        ringLayer.shadowColor = NSColor.black.cgColor
+        ringLayer.shadowOpacity = 0.5
+        ringLayer.shadowRadius = 5
+        ringLayer.shadowOffset = .zero
+        layer?.addSublayer(ringLayer)
+
+        // 中心の録音ドット
+        let coreD: CGFloat = 10
+        coreLayer.bounds = CGRect(x: 0, y: 0, width: coreD, height: coreD)
+        coreLayer.position = center
+        coreLayer.path = CGPath(ellipseIn: coreLayer.bounds, transform: nil)
+        coreLayer.fillColor = Config.cursorCoreColor.cgColor
+        coreLayer.contentsScale = scale
+        coreLayer.shadowColor = Config.cursorCoreColor.cgColor
+        coreLayer.shadowOpacity = 0.6
+        coreLayer.shadowRadius = 3
+        coreLayer.shadowOffset = .zero
+        layer?.addSublayer(coreLayer)
+
+        // 文字数ラベル（リングの下）
+        countLayer.string = "0字"
+        countLayer.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
+        countLayer.fontSize = 15
+        countLayer.alignmentMode = .center
+        countLayer.foregroundColor = NSColor.white.cgColor
+        countLayer.contentsScale = scale
+        countLayer.shadowColor = NSColor.black.cgColor
+        countLayer.shadowOpacity = 0.7
+        countLayer.shadowRadius = 3
+        countLayer.shadowOffset = .zero
+        countLayer.frame = CGRect(x: 0, y: 10, width: bounds.width, height: 20)
+        layer?.addSublayer(countLayer)
     }
 
-    /// 2色を t(0〜1) で線形補間
-    static func blend(_ a: NSColor, _ b: NSColor, _ t: CGFloat) -> NSColor {
-        let ca = a.usingColorSpace(.sRGB) ?? a
-        let cb = b.usingColorSpace(.sRGB) ?? b
-        return NSColor(srgbRed: ca.redComponent + (cb.redComponent - ca.redComponent) * t,
-                       green: ca.greenComponent + (cb.greenComponent - ca.greenComponent) * t,
-                       blue: ca.blueComponent + (cb.blueComponent - ca.blueComponent) * t,
-                       alpha: 1)
+    func setCount(_ count: Int) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        countLayer.string = "\(count)字"
+        CATransaction.commit()
+    }
+
+    func start() {
+        level = 0; displayedLevel = 0; phase = 0; lastTick = Date()
+        setCount(0)
+        guard timer == nil else { return }
+        let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+        // 周期的に波紋を出して目を引く
+        spawnRipple()
+        let rt = Timer(timeInterval: 1.3, repeats: true) { [weak self] _ in self?.spawnRipple() }
+        RunLoop.main.add(rt, forMode: .common)
+        rippleTimer = rt
+    }
+
+    func stop() {
+        timer?.invalidate(); timer = nil
+        rippleTimer?.invalidate(); rippleTimer = nil
+    }
+
+    /// 外側へ広がってフェードする波紋リングを1つ出す
+    private func spawnRipple() {
+        guard let host = layer else { return }
+        let d = Config.cursorBaseDiameter
+        let r = CAShapeLayer()
+        r.bounds = CGRect(x: 0, y: 0, width: d, height: d)
+        r.position = CGPoint(x: bounds.midX, y: bounds.midY)
+        r.path = CGPath(ellipseIn: r.bounds, transform: nil)
+        r.fillColor = NSColor.clear.cgColor
+        r.strokeColor = Config.cursorRingColor.cgColor
+        r.lineWidth = 2.5
+        r.contentsScale = backingScale
+        r.shadowColor = NSColor.black.cgColor
+        r.shadowOpacity = 0.4
+        r.shadowRadius = 3
+        host.insertSublayer(r, below: ringLayer)
+
+        let dur: CFTimeInterval = 1.6
+        let scaleAnim = CABasicAnimation(keyPath: "transform.scale")
+        scaleAnim.fromValue = 1.0
+        scaleAnim.toValue = 3.0
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 0.6
+        fade.toValue = 0.0
+        let group = CAAnimationGroup()
+        group.animations = [scaleAnim, fade]
+        group.duration = dur
+        group.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        group.isRemovedOnCompletion = true
+        r.add(group, forKey: nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + dur) { r.removeFromSuperlayer() }
+    }
+
+    private func tick() {
+        let now = Date()
+        let dt = min(0.05, now.timeIntervalSince(lastTick))
+        lastTick = now
+
+        // 音量はなめらかに追従（上品さのため強めに平滑化）
+        displayedLevel += (level - displayedLevel) * 0.18
+        // ゆっくりした呼吸（約2.4秒周期）
+        phase += dt * (2 * Double.pi / 2.4)
+        let breathe = CGFloat(sin(phase) * 0.5 + 0.5)   // 0〜1
+        let lv = max(0, min(1, displayedLevel))
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)   // 自前の平滑化を使う（暗黙アニメ無効）
+
+        // リング：呼吸＋音量でそっと拡大、わずかに濃く、グローが強まる
+        let ringScale = 1.0 + breathe * 0.08 + lv * 1.1
+        ringLayer.transform = CATransform3DMakeScale(ringScale, ringScale, 1)
+        ringLayer.opacity = Float(0.55 + breathe * 0.15 + lv * 0.4)
+        ringLayer.shadowRadius = 4 + lv * 8
+
+        // 中心ドット：呼吸でほのかに明滅
+        coreLayer.opacity = Float(0.7 + breathe * 0.3)
+        let coreScale = 1.0 + lv * 0.5
+        coreLayer.transform = CATransform3DMakeScale(coreScale, coreScale, 1)
+
+        CATransaction.commit()
     }
 }
 
@@ -396,13 +533,21 @@ final class CursorIndicator {
         levelView?.level = CGFloat(level)
     }
 
+    /// 認識中の文字数を反映
+    func setCharCount(_ count: Int) {
+        levelView?.setCount(count)
+    }
+
     func show() {
         if panel == nil { setup() }
         reposition()
         panel?.orderFrontRegardless()
         effectView?.start()
-        tracker = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            self?.reposition()
+        // マウス追従のときだけ毎フレーム位置更新。固定表示なら不要。
+        if Config.indicatorPosition == .mouse {
+            tracker = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+                self?.reposition()
+            }
         }
     }
 
@@ -424,7 +569,7 @@ final class CursorIndicator {
             view = gif
             levelView = nil
         } else {
-            panelSize = NSSize(width: 56, height: 56)
+            panelSize = NSSize(width: 130, height: 130)
             let dot = LevelDotView(frame: NSRect(origin: .zero, size: panelSize))
             view = dot
             levelView = dot
@@ -446,9 +591,32 @@ final class CursorIndicator {
 
     private func reposition() {
         guard let panel = panel else { return }
-        let m = NSEvent.mouseLocation // マウスを中心に
-        panel.setFrameOrigin(NSPoint(x: m.x - panelSize.width / 2,
-                                     y: m.y - panelSize.height / 2))
+        let w = panelSize.width, h = panelSize.height
+
+        if Config.indicatorPosition == .mouse {
+            let m = NSEvent.mouseLocation
+            panel.setFrameOrigin(NSPoint(x: m.x - w / 2, y: m.y - h / 2))
+            return
+        }
+
+        let screen = NSScreen.main ?? NSScreen.screens.first
+        guard let f = screen?.frame else { return }
+        let ringFromTop: CGFloat = 30   // 画面上端からリング中心まで
+        let margin: CGFloat = 12
+        var origin = NSPoint(x: f.midX - w / 2, y: f.maxY - ringFromTop - h / 2)
+        switch Config.indicatorPosition {
+        case .topCenter:
+            break
+        case .bottomCenter:
+            origin = NSPoint(x: f.midX - w / 2, y: f.minY + margin)
+        case .bottomLeft:
+            origin = NSPoint(x: f.minX + margin, y: f.minY + margin)
+        case .topRight:
+            origin = NSPoint(x: f.maxX - w - margin, y: f.maxY - ringFromTop - h / 2)
+        case .mouse:
+            break
+        }
+        panel.setFrameOrigin(origin)
     }
 }
 
@@ -522,12 +690,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.onStateChange = { [weak self] active in
             DispatchQueue.main.async {
                 guard let self = self else { return }
-                self.statusItem.button?.title = active ? "🔴" : "🎙️"
+                let btn = self.statusItem.button
+                btn?.image = self.symbolImage(active ? "mic.fill" : "mic")
+                btn?.contentTintColor = active ? .systemRed : nil
                 if active { self.cursorIndicator.show() } else { self.cursorIndicator.hide() }
             }
         }
         controller.engine.onLevel = { [weak self] level in
             self?.cursorIndicator.setLevel(level)   // onLevel は既にメインスレッド
+        }
+        controller.engine.onCharCount = { [weak self] count in
+            self?.cursorIndicator.setCharCount(count)
         }
         controller.engine.onError = { msg in
             DispatchQueue.main.async {
@@ -558,9 +731,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// メニューバー用の SF Symbol 画像（テンプレート＝ダーク/ライト自動対応）
+    private func symbolImage(_ name: String) -> NSImage? {
+        let cfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
+        let img = NSImage(systemSymbolName: name, accessibilityDescription: "VoiceOn")?
+            .withSymbolConfiguration(cfg)
+        img?.isTemplate = true
+        return img
+    }
+
     private func setupStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.title = "🎙️"
+        statusItem.button?.image = symbolImage("mic")
         let menu = NSMenu()
         menu.addItem(withTitle: "VoiceOn — 「英数」長押しで音声入力", action: nil, keyEquivalent: "")
         menu.addItem(.separator())
