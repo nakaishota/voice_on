@@ -1,0 +1,19 @@
+# ビルド成果物
+.build/
+*.app/
+
+# SwiftPM
+.swiftpm/
+Package.resolved
+
+# macOS
+.DS_Store
+
+# ログ
+*.log
+
+# エディタ/エージェント設定
+.claude/
+
+# アイコン等のローカル素材（必要なら除外を外す）
+cursor.gif
