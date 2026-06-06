@@ -540,6 +540,9 @@ final class CursorIndicator {
 
     func show() {
         if panel == nil { setup() }
+        // 表示するたびに全Space表示・最前面設定を貼り直す（Space/アプリ切替で外れる対策）
+        panel?.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
+        panel?.level = .statusBar
         reposition()
         panel?.orderFrontRegardless()
         effectView?.start()
@@ -599,7 +602,10 @@ final class CursorIndicator {
             return
         }
 
-        let screen = NSScreen.main ?? NSScreen.screens.first
+        // 今いる画面（マウスのある画面）に出す。別ディスプレイでも見える側に表示される。
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) })
+            ?? NSScreen.main ?? NSScreen.screens.first
         guard let f = screen?.frame else { return }
         let ringFromTop: CGFloat = 30   // 画面上端からリング中心まで
         let margin: CGFloat = 12
@@ -675,6 +681,15 @@ func startEventTap() -> Bool {
     let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
     CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
     CGEvent.tapEnable(tap: tap, enable: true)
+
+    // ウォッチドッグ: タップが無効化されたら自動で再有効化（安全網）
+    let watchdog = Timer(timeInterval: 1.0, repeats: true) { _ in
+        guard let tap = eventTap else { return }
+        if !CGEvent.tapIsEnabled(tap: tap) {
+            CGEvent.tapEnable(tap: tap, enable: true)
+        }
+    }
+    RunLoop.main.add(watchdog, forMode: .common)
     return true
 }
 
